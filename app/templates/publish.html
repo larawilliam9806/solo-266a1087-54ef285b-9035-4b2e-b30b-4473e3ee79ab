@@ -68,6 +68,23 @@
   </div>
 </div>
 
+<div class="card">
+  <h2 style="margin-top:0">重算当前生效版组合表</h2>
+  <p class="muted" style="margin-top:0">
+    用<strong>当前生效版本的原图</strong>重新核算整版最小用梯/复运组合，并把修正版作为新版本发布。
+    待发草稿留给正常发布，重算不会读取或清除草稿，也不改动停运名单。
+    重算在事务外进行，期间导航查询、停运登记和发图（上传/发布）照常可用；
+    整版算完提交时，只有原版本仍生效才会切换，否则丢弃本次结果并提示刷新。
+    计算或保存失败时，始终按当时的生效版继续供数。
+  </p>
+  <form method="post" action="{{ url_for('recalculate_submit') }}">
+    <button type="submit" class="secondary" {% if not active_version %}disabled{% endif %}>
+      重算版本 {{ active_version if active_version else '—' }} 的整版组合表
+    </button>
+    {% if not active_version %}<span class="muted">尚无生效版本，无法重算。</span>{% endif %}
+  </form>
+</div>
+
 <h2>版本历史</h2>
 {% if versions %}
   <div class="card">

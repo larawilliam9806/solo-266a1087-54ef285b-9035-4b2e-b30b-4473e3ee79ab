@@ -19,12 +19,19 @@ the table: for a blocked direction, ``M ∩ outages`` for every working set
 ``M``; the inclusion-minimal ones are exactly the minimal sets of elevators
 whose restoration makes the direction work again.
 
-Direction semantics (both are universal over entrances):
+Direction semantics (existential over entrances; the two directions are
+independent and may be served by *different* entrances):
 
-* ``entrance_to_platform``: *every* entrance can reach the platform.
-* ``platform_to_entrance``: the platform can reach *every* entrance.
+* ``entrance_to_platform``: *some* entrance can reach the platform — the
+  passenger may enter through any one reachable entrance.
+* ``platform_to_entrance``: the platform can reach *some* entrance — the
+  passenger may leave through any one reachable entrance.
 
-Each may be empty (``[]``) — no elevator needed — or impossible (``None``).
+When only part of the entrances are connected, a direction still works as
+long as one entrance serves it; an entrance usable for entering does not
+have to be the same one usable for exiting.
+
+Each direction may be elevator-free (``[[]]``) or impossible (``None``).
 """
 
 from __future__ import annotations
@@ -216,10 +223,7 @@ def _adjacency(station: Station, usable: frozenset[str]) -> dict[str, list[str]]
     return adj
 
 
-def _reachable_from(
-    station: Station, start: str, usable: frozenset[str]
-) -> set[str]:
-    adj = _adjacency(station, usable)
+def _reachable(adj: dict[str, list[str]], start: str) -> set[str]:
     seen = {start}
     stack = [start]
     while stack:
@@ -234,18 +238,27 @@ def _reachable_from(
 def direction_works(
     station: Station, platform_node: str, direction: str, usable: frozenset[str]
 ) -> bool:
+    """Whether a direction is usable with the given elevators running.
+
+    The rule is existential over entrances, and each direction is judged
+    independently: entering needs only *one* entrance that reaches the
+    platform, exiting needs only *one* entrance reachable from the
+    platform; they need not be the same entrance.
+    """
+
     if not station.entrances or not station.platforms:
         return False
+    adj = _adjacency(station, usable)
     if direction == "entrance_to_platform":
-        # Every entrance must reach the platform.
-        return all(
-            platform_node in _reachable_from(station, e, usable)
+        # Any entrance reaching the platform is enough to enter.
+        return any(
+            platform_node in _reachable(adj, e)
             for e in station.entrance_nodes
         )
     if direction == "platform_to_entrance":
-        # The platform must reach every entrance.
-        reached = _reachable_from(station, platform_node, usable)
-        return all(e in reached for e in station.entrance_nodes)
+        # Reaching any entrance is enough to exit.
+        reached = _reachable(adj, platform_node)
+        return any(e in reached for e in station.entrance_nodes)
     raise ValueError(f"unknown direction: {direction}")
 
 

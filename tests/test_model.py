@@ -53,10 +53,79 @@ def test_parse_allows_ten_elevators():
 
 
 def test_minimal_sets_two_independent_routes():
+    # Two entrances, each with its own elevator in each direction.  Either
+    # entrance alone is enough, so the two single-elevator sets are the
+    # complete minimal antichain (not their union).
     station = model.parse_station(two_entrance_doc())
     tables = model.build_station_tables(station)
-    assert tables["P1"]["entrance_to_platform"]["sets"] == [["E1", "E2"]]
-    assert tables["P1"]["platform_to_entrance"]["sets"] == [["E1", "E2"]]
+    assert tables["P1"]["entrance_to_platform"]["sets"] == [["E1"], ["E2"]]
+    assert tables["P1"]["platform_to_entrance"]["sets"] == [["E1"], ["E2"]]
+
+
+def test_partial_entrance_connectivity_uses_different_entrances_per_direction():
+    # Entering is only possible via A (E1), exiting only via B (E2): the two
+    # directions are served by different entrances and must be judged
+    # independently.  An entrance that cannot serve one direction must not
+    # make that direction report "blocked".
+    doc = station_doc(
+        passages=[
+            {"from": "entrance:A", "to": "platform:P1", "elevator": "E1"},
+            {"from": "platform:P1", "to": "entrance:B", "elevator": "E2"},
+        ]
+    )
+    station = model.parse_station(doc)
+    tables = model.build_station_tables(station)
+    assert tables["P1"]["entrance_to_platform"]["sets"] == [["E1"]]
+    assert tables["P1"]["platform_to_entrance"]["sets"] == [["E2"]]
+
+    report = model.evaluate_station(meta_for(station), tables, set())
+    platform = report["platforms"][0]
+    assert platform["enterable"] is True
+    assert platform["exitable"] is True
+    assert platform["status"] == "ok"
+
+    # E1 out: entering breaks, exiting through B still works.
+    report = model.evaluate_station(meta_for(station), tables, {"E1"})
+    platform = report["platforms"][0]
+    assert platform["enterable"] is False
+    assert platform["exitable"] is True
+    assert platform["entrance_to_platform"]["minimal_recovery_sets"] == [["E1"]]
+    assert platform["platform_to_entrance"]["minimal_recovery_sets"] is None
+
+    # E2 out: the mirror image.
+    report = model.evaluate_station(meta_for(station), tables, {"E2"})
+    platform = report["platforms"][0]
+    assert platform["enterable"] is True
+    assert platform["exitable"] is False
+
+    # Both out: each direction keeps its own recovery combination.
+    report = model.evaluate_station(meta_for(station), tables, {"E1", "E2"})
+    platform = report["platforms"][0]
+    assert platform["enterable"] is False
+    assert platform["exitable"] is False
+    assert platform["status"] == "blocked"
+    assert platform["entrance_to_platform"]["minimal_recovery_sets"] == [["E1"]]
+    assert platform["platform_to_entrance"]["minimal_recovery_sets"] == [["E2"]]
+
+
+def test_unconnected_entrance_does_not_block_direction():
+    # Entrance C has no passages at all, but A alone still serves both
+    # directions: the rule is existential over entrances.
+    doc = station_doc(
+        entrances=("A", "B", "C"),
+        passages=[
+            {"from": "entrance:A", "to": "platform:P1", "elevator": "E1"},
+            {"from": "platform:P1", "to": "entrance:A", "elevator": "E1"},
+        ],
+    )
+    station = model.parse_station(doc)
+    tables = model.build_station_tables(station)
+    assert tables["P1"]["entrance_to_platform"]["sets"] == [["E1"]]
+    assert tables["P1"]["platform_to_entrance"]["sets"] == [["E1"]]
+
+    report = model.evaluate_station(meta_for(station), tables, set())
+    assert report["platforms"][0]["status"] == "ok"
+
 
 
 def test_antichain_is_complete_and_minimal_on_demo():
@@ -123,8 +192,8 @@ def test_empty_entrance_set_makes_platform_unreachable():
 # ---------------------------------------------------------------------------
 
 def test_evaluation_filters_table_and_keeps_minimality():
-    # Two alternative routes: E1 alone? No — build a case with sets
-    # {E1,E2} and {E2,E3}.
+    # Three independent single-elevator routes into the same platform.
+    # Any one route is enough, so the calibrated antichain is {E1}, {E2}, {E3}.
     doc = station_doc(
         entrances=("A", "B", "C"),
         passages=[
@@ -132,40 +201,51 @@ def test_evaluation_filters_table_and_keeps_minimality():
             {"from": "platform:P1", "to": "entrance:A", "elevator": "E1"},
             {"from": "entrance:B", "to": "platform:P1", "elevator": "E2"},
             {"from": "platform:P1", "to": "entrance:B", "elevator": "E2"},
-            {"from": "entrance:C", "to": "platform:P1"},
-            {"from": "platform:P1", "to": "entrance:C"},
+            {"from": "entrance:C", "to": "platform:P1", "elevator": "E3"},
+            {"from": "platform:P1", "to": "entrance:C", "elevator": "E3"},
         ],
     )
     station = model.parse_station(doc)
     tables = model.build_station_tables(station)
-    assert tables["P1"]["entrance_to_platform"]["sets"] == [["E1", "E2"]]
+    assert tables["P1"]["entrance_to_platform"]["sets"] == [
+        ["E1"], ["E2"], ["E3"]
+    ]
 
-    # E1 out: direction blocked, recovery must be exactly {E1}.
+    # E1 out: two routes still work, recovery can be just {E1} (or any of the
+    # other routes' elevators — but those are still running, so only E1 is an
+    # actual outage; the minimal recovery set is therefore {E1}).
     report = model.evaluate_station(meta_for(station), tables, {"E1"})
     cell = report["platforms"][0]["entrance_to_platform"]
-    assert cell["accessible"] is False
-    assert cell["minimal_recovery_sets"] == [["E1"]]
+    assert cell["accessible"] is True
+    assert cell["minimal_elevator_sets"] == [["E2"], ["E3"]]
+    assert cell["minimal_recovery_sets"] is None
 
-    # E2 out too: the only recovery combination is restoring either one?
-    # With both out, restoring either E1 or E2 alone is not enough (both are
-    # needed), so the minimal recovery is {E1, E2}.
-    report = model.evaluate_station(meta_for(station), tables, {"E1", "E2"})
+    # Every route's elevator out: direction blocked, and restoring any single
+    # elevator restores one route, so each singleton is a minimal recovery.
+    report = model.evaluate_station(meta_for(station), tables, {"E1", "E2", "E3"})
     cell = report["platforms"][0]["entrance_to_platform"]
-    assert cell["minimal_recovery_sets"] == [["E1", "E2"]]
+    assert cell["accessible"] is False
+    assert cell["minimal_recovery_sets"] == [["E1"], ["E2"], ["E3"]]
 
 
 def test_recovery_lists_every_minimal_combination():
-    # Three entrances each needing its own elevator; every minimal working
-    # set is the full trio, but if two are out the recovery is the pair.
-    passages = []
-    for name, elevator in (("A", "E1"), ("B", "E2"), ("C", "E3")):
-        passages.append(
-            {"from": f"entrance:{name}", "to": "platform:P1", "elevator": elevator}
-        )
-        passages.append(
-            {"from": "platform:P1", "to": f"entrance:{name}", "elevator": elevator}
-        )
-    station = model.parse_station(station_doc(entrances=("A", "B", "C"), passages=passages))
+    # A single entrance route needing three elevators end to end:
+    #   A --E1--> P2 --E2--> P3 --E3--> P1 (mirrored passages for outbound).
+    # The only minimal working set is the full trio, so a blocked direction
+    # needs every outaged elevator restored together.
+    doc = station_doc(
+        entrances=("A",),
+        platforms=("P1", "P2", "P3"),
+        passages=[
+            {"from": "entrance:A", "to": "platform:P2", "elevator": "E1"},
+            {"from": "platform:P2", "to": "entrance:A", "elevator": "E1"},
+            {"from": "platform:P2", "to": "platform:P3", "elevator": "E2"},
+            {"from": "platform:P3", "to": "platform:P2", "elevator": "E2"},
+            {"from": "platform:P3", "to": "platform:P1", "elevator": "E3"},
+            {"from": "platform:P1", "to": "platform:P3", "elevator": "E3"},
+        ],
+    )
+    station = model.parse_station(doc)
     tables = model.build_station_tables(station)
     assert tables["P1"]["entrance_to_platform"]["sets"] == [["E1", "E2", "E3"]]
 
@@ -176,32 +256,36 @@ def test_recovery_lists_every_minimal_combination():
 
 
 def test_alternative_recovery_combinations():
-    # Two disjoint routes, each needing two elevators:
-    #   route 1 = {E1,E2}, route 2 = {E3,E4}
+    # Two disjoint chain routes from one entrance, each needing two lifts:
+    #   route 1: A --E1--> P2 --E2--> P1
+    #   route 2: A --E3--> P3 --E4--> P1
+    # so the calibrated antichain is {E1,E2} / {E3,E4}.
     doc = station_doc(
-        entrances=("A", "B", "C", "D"),
+        entrances=("A",),
+        platforms=("P1", "P2", "P3"),
         passages=[
-            {"from": "entrance:A", "to": "platform:P1", "elevator": "E1"},
-            {"from": "platform:P1", "to": "entrance:A", "elevator": "E1"},
-            {"from": "entrance:B", "to": "platform:P1", "elevator": "E2"},
-            {"from": "platform:P1", "to": "entrance:B", "elevator": "E2"},
-            {"from": "entrance:C", "to": "platform:P1", "elevator": "E3"},
-            {"from": "platform:P1", "to": "entrance:C", "elevator": "E3"},
-            {"from": "entrance:D", "to": "platform:P1", "elevator": "E4"},
-            {"from": "platform:P1", "to": "entrance:D", "elevator": "E4"},
+            {"from": "entrance:A", "to": "platform:P2", "elevator": "E1"},
+            {"from": "platform:P2", "to": "entrance:A", "elevator": "E1"},
+            {"from": "platform:P2", "to": "platform:P1", "elevator": "E2"},
+            {"from": "platform:P1", "to": "platform:P2", "elevator": "E2"},
+            {"from": "entrance:A", "to": "platform:P3", "elevator": "E3"},
+            {"from": "platform:P3", "to": "entrance:A", "elevator": "E3"},
+            {"from": "platform:P3", "to": "platform:P1", "elevator": "E4"},
+            {"from": "platform:P1", "to": "platform:P3", "elevator": "E4"},
         ],
     )
     station = model.parse_station(doc)
     tables = model.build_station_tables(station)
     working = tables["P1"]["entrance_to_platform"]["sets"]
-    assert working == [["E1", "E2", "E3", "E4"]]
+    assert working == [["E1", "E2"], ["E3", "E4"]]
 
+    # E1, E3, E4 out: route 1 misses only E1, route 2 misses both of its
+    # lifts.  Restoring {E1} alone revives route 1; restoring {E3, E4}
+    # revives route 2 — both are minimal, neither contains the other.
     report = model.evaluate_station(meta_for(station), tables, {"E1", "E3", "E4"})
     cell = report["platforms"][0]["entrance_to_platform"]
     assert cell["accessible"] is False
-    # Every entrance needs its own elevator, so every outaged one has to
-    # come back; the only minimal recovery is the whole outaged set.
-    assert cell["minimal_recovery_sets"] == [["E1", "E3", "E4"]]
+    assert cell["minimal_recovery_sets"] == [["E1"], ["E3", "E4"]]
 
 
 def test_alternative_routes_give_multiple_recovery_sets():
@@ -266,7 +350,7 @@ def test_trimmed_tables_cannot_be_extended_by_client():
     second = model.evaluate_station(meta_for(station), tables, set())
     assert second["platforms"][0]["entrance_to_platform"][
         "minimal_elevator_sets"
-    ] == [["E1", "E2"]]
+    ] == [["E1"], ["E2"]]
 
 
 def test_every_table_subset_matches_direct_graph_search():

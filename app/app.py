@@ -398,6 +398,65 @@ def _register_web_routes(app: Flask) -> None:
         flash(f"已发布地图版本 {version_id}，组合表与当前停运名单一同生效。", "info")
         return redirect(url_for("publish_page"))
 
+    @app.post("/admin/recalculate")
+    def recalculate_submit():
+        """Recalibrate the *active* version's original drawings.
+
+        Drafts are deliberately not part of this flow: they stay staged for
+        the normal publish.  Calibration runs without holding the SQLite
+        write lock, so navigation queries, outage edits, uploads and normal
+        publishing all keep working while the whole map is recomputed.
+        """
+
+        conn = get_db()
+        source_version_id = db.active_version_id(conn)
+        if source_version_id is None:
+            flash("还没有生效版本，无法重算。请先正常发布一版地图。", "error")
+            return redirect(url_for("publish_page"))
+
+        # Snapshot the active drawings outside any write transaction.
+        docs = db.version_docs(conn, source_version_id)
+        if not docs:
+            flash("当前生效版本没有站点图，无法重算。", "error")
+            return redirect(url_for("publish_page"))
+
+        try:
+            calibrated = _calibrate(docs)
+        except model.SchemaError as exc:
+            _record_publish_failure(
+                conn, f"重算失败（版本 {source_version_id}）：{exc}"
+            )
+            flash(f"重算失败，继续按当前生效版供数：{exc}", "error")
+            return redirect(url_for("publish_page"))
+        except Exception as exc:  # pragma: no cover - defensive
+            _record_publish_failure(
+                conn, f"重算异常（版本 {source_version_id}）：{exc}"
+            )
+            flash(f"重算异常，继续按当前生效版供数：{exc}", "error")
+            return redirect(url_for("publish_page"))
+
+        try:
+            version_id = _commit_recalculate(conn, calibrated, source_version_id)
+        except _PublishAbort as exc:
+            _record_publish_failure(
+                conn, f"重算中止（基于版本 {source_version_id}）：{exc}"
+            )
+            flash(f"重算结果已丢弃：{exc}", "error")
+            return redirect(url_for("publish_page"))
+        except Exception as exc:  # pragma: no cover - defensive
+            _record_publish_failure(
+                conn, f"重算保存失败（版本 {source_version_id}）：{exc}"
+            )
+            flash(f"保存失败，继续按当前生效版供数：{exc}", "error")
+            return redirect(url_for("publish_page"))
+
+        flash(
+            f"已用版本 {source_version_id} 的原图重算整版组合表，"
+            f"修正版 {version_id} 生效；待发草稿未受影响。",
+            "info",
+        )
+        return redirect(url_for("publish_page"))
+
     @app.get("/admin/outages")
     def outages_page():
         conn = get_db()
@@ -528,6 +587,69 @@ def _commit_publish(
     except BaseException:
         conn.rollback()
         raise
+
+
+def _commit_recalculate(
+    conn: sqlite3.Connection,
+    calibrated: dict[str, dict],
+    source_version_id: int,
+) -> int:
+    """Atomically write recalibrated tables and switch the active pointer.
+
+    The recalculated result is based on the drawings of
+    ``source_version_id``.  It may only be published when that version is
+    *still* the active one at commit time: if another publish or
+    recalculation switched the pointer while calibration was running, the
+    result is discarded and the caller is told to refresh.  Drafts and the
+    outage list are never touched by a recalculation.
+    """
+
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        current_version_id = db.active_version_id(conn)
+        if current_version_id != source_version_id:
+            raise _PublishAbort(
+                f"重算基于版本 {source_version_id}，但当前生效版本已变为 "
+                f"{current_version_id}，请刷新页面后重试"
+            )
+
+        cur = conn.execute(
+            "INSERT INTO map_versions (created_at, note) VALUES (?, ?)",
+            (
+                db.utcnow(),
+                f"重算版本 {source_version_id} 的组合表（原图不变，不涉及草稿）",
+            ),
+        )
+        version_id = cur.lastrowid
+        for station_id in sorted(calibrated):
+            info = calibrated[station_id]
+            conn.execute(
+                "INSERT INTO station_maps "
+                "(version_id, station_id, name, doc, meta, tables) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    version_id,
+                    station_id,
+                    info["station"].name,
+                    model.dumps(info["doc"]),
+                    model.dumps(info["meta"]),
+                    model.dumps(info["tables"]),
+                ),
+            )
+        db.set_setting(conn, "active_version_id", str(version_id))
+        db.log_publish(
+            conn,
+            "success",
+            f"重算版本 {source_version_id} → 修正版 {version_id}；"
+            f"共 {len(calibrated)} 个站点，草稿与停运名单未改动",
+            version_id,
+            commit=False,
+        )
+        conn.commit()
+        return version_id
+    except BaseException:
+        conn.rollback()
+        raise
 # ---------------------------------------------------------------------------
 # API routes (navigation client)
 # ---------------------------------------------------------------------------
@@ -623,8 +745,12 @@ def _register_cli(app: Flask) -> None:
                         conn, station.station_id, model.station_to_doc(station)
                     )
                 if not db.list_outages(conn):
-                    for elevator in ("S1-E2",):
-                        db.set_outage(conn, elevator, True, "S1", "例行检修")
+                    # S2's 上行 platform has two independent elevator routes
+                    # (via entrance 1 / S2-E1 and entrance 2 / S2-E2); taking
+                    # both out blocks that platform while leaving alternatives
+                    # visible elsewhere.
+                    for elevator in ("S2-E1", "S2-E2"):
+                        db.set_outage(conn, elevator, True, "S2", "例行检修")
         finally:
             conn.close()
         print("demo drafts written; open /admin/publish to publish")
